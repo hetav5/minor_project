@@ -3,6 +3,7 @@ import json
 import math
 import sqlite3
 import time
+import urllib.error
 import urllib.request
 import webbrowser
 from collections import deque
@@ -25,6 +26,7 @@ LOCK_LOCATION_TO_VANDALUR = True
 
 # Optional weather API for live temperature/humidity
 WEATHER_UPDATE_INTERVAL = 300  # seconds
+WEATHER_RETRY_INTERVAL = 60  # seconds
 LOG_UPDATE_INTERVAL_MS = 1000  # milliseconds
 
 # Theme
@@ -75,6 +77,8 @@ speed = 0.0
 
 # Weather cache
 last_weather_fetch = 0
+last_weather_attempt = 0
+weather_error_logged = False
 cached_weather = {"temp": None, "humidity": None}
 
 
@@ -104,13 +108,20 @@ def calculate_risk(temp, hr):
 
 
 def fetch_weather(lat, lon):
-    global last_weather_fetch, cached_weather
+    global last_weather_fetch, last_weather_attempt, weather_error_logged, cached_weather
 
     now_epoch = time.time()
+
+    # Use cached weather until the configured refresh interval expires.
     if now_epoch - last_weather_fetch < WEATHER_UPDATE_INTERVAL:
         return cached_weather
 
+    # If API is down/offline, back off retries to avoid noisy logs.
+    if now_epoch - last_weather_attempt < WEATHER_RETRY_INTERVAL:
+        return cached_weather
+
     try:
+        last_weather_attempt = now_epoch
         url = (
             "https://api.open-meteo.com/v1/forecast"
             f"?latitude={lat}&longitude={lon}"
@@ -120,13 +131,25 @@ def fetch_weather(lat, lon):
             payload = json.loads(response.read().decode("utf-8"))
 
         current = payload.get("current", {})
+        temperature = current.get("temperature_2m")
+        humidity = current.get("relative_humidity_2m")
+
         cached_weather = {
-            "temp": int(round(current.get("temperature_2m", 0))),
-            "humidity": int(round(current.get("relative_humidity_2m", 0))),
+            "temp": int(round(temperature)) if temperature is not None else None,
+            "humidity": int(round(humidity)) if humidity is not None else None,
         }
         last_weather_fetch = now_epoch
+        weather_error_logged = False
+    except urllib.error.URLError as exc:
+        if not weather_error_logged:
+            print(
+                f"Weather fetch unavailable ({exc}). Using sensor/default values.")
+            weather_error_logged = True
     except Exception as exc:
-        print(f"Weather fetch failed: {exc}")
+        if not weather_error_logged:
+            print(
+                f"Weather fetch failed ({exc}). Using sensor/default values.")
+            weather_error_logged = True
 
     return cached_weather
 
