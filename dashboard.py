@@ -13,13 +13,14 @@ import serial
 import tkinter as tk
 
 # ── Serial ────────────────────────────────────────────────────────────────────
-SERIAL_PORT = "COM3"
-SERIAL_BAUD = 74880
+RECEIVER_PORT   = "COM7"   # ESP8266 receiver
+TRANSMITTER_PORT = "COM4"  # ESP32 transmitter (for debug monitoring only)
+SERIAL_BAUD     = 74880    # ESP8266 baud rate
 
 # ── Location ──────────────────────────────────────────────────────────────────
 VANDALUR_LAT = 12.8797
 VANDALUR_LON = 80.0810
-LOCK_LOCATION_TO_VANDALUR = True
+LOCK_LOCATION_TO_VANDALUR = False  # False = use real GPS when fix available
 
 # ── Timing ────────────────────────────────────────────────────────────────────
 LOG_UPDATE_INTERVAL_MS = 1000
@@ -39,14 +40,17 @@ HIGH_COL = "#E07B54"
 CRIT_COL = "#E63946"
 
 # ── Serial connection ─────────────────────────────────────────────────────────
-def open_serial_connection():
+def open_serial_connection(port, baud):
     try:
-        return serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
+        s = serial.Serial(port, baud, timeout=1)
+        print(f"Connected to {port} at {baud} baud")
+        return s
     except Exception as exc:
-        print(f"Serial not connected ({exc}). Running in sim mode.")
+        print(f"Could not open {port}: {exc}")
         return None
 
-ser = open_serial_connection()
+ser = open_serial_connection(RECEIVER_PORT, SERIAL_BAUD)
+
 pygame.mixer.init()
 
 # ── CSV ───────────────────────────────────────────────────────────────────────
@@ -61,6 +65,7 @@ CREATE TABLE IF NOT EXISTS logs(
   time TEXT, temp REAL, pressure REAL,
   ax INT, ay INT, az INT,
   lat REAL, lon REAL,
+  gps_fix INT,
   risk TEXT, fall_detected INT)
 """)
 conn.commit()
@@ -72,6 +77,7 @@ def ensure_logs_schema():
         "time": "TEXT", "temp": "REAL", "pressure": "REAL",
         "ax": "INT", "ay": "INT", "az": "INT",
         "lat": "REAL", "lon": "REAL",
+        "gps_fix": "INT",
         "risk": "TEXT", "fall_detected": "INT",
     }
     for name, col_type in required.items():
@@ -87,10 +93,15 @@ times = deque(maxlen=30)
 path  = []
 
 last_known = {
-    "temp": None, "pressure": None,
-    "ax": None, "ay": None, "az": None,
-    "lat": VANDALUR_LAT, "lon": VANDALUR_LON,
-    "risk": None,
+    "temp":     None,
+    "pressure": None,
+    "ax":       None,
+    "ay":       None,
+    "az":       None,
+    "lat":      VANDALUR_LAT,
+    "lon":      VANDALUR_LON,
+    "risk":     None,
+    "fix":      "0",      # "1" = real GPS lock, "0" = no fix
 }
 
 
@@ -119,6 +130,7 @@ def parse_sensor_data(raw):
             int(parts["AZ"]),
             float(parts["LAT"]),
             float(parts["LON"]),
+            parts.get("FIX", "0"),   # GPS fix status
         )
     except (KeyError, ValueError):
         return None
@@ -130,25 +142,42 @@ def read_sample():
         raw = ser.readline().decode(errors="ignore").strip()
         if raw:
             print(raw)
+
             if raw.startswith("RISK:"):
                 last_known["risk"] = raw[5:].strip()
+
+            elif raw.startswith("FIX:"):
+                last_known["fix"] = raw[4:].strip()
+
             else:
                 result = parse_sensor_data(raw)
                 if result:
-                    temp, pressure, ax, ay, az, s_lat, s_lon = result
+                    temp, pressure, ax, ay, az, s_lat, s_lon, fix = result
                     last_known["temp"]     = temp
                     last_known["pressure"] = pressure
                     last_known["ax"]       = ax
                     last_known["ay"]       = ay
                     last_known["az"]       = az
-                    if not LOCK_LOCATION_TO_VANDALUR:
+                    last_known["fix"]      = fix
+
+                    # Use real GPS coords when fix is available
+                    # Otherwise keep Vandalur as fallback
+                    if fix == "1":
                         last_known["lat"] = s_lat
                         last_known["lon"] = s_lon
+                    elif not LOCK_LOCATION_TO_VANDALUR and fix == "0":
+                        # No fix — keep last known real coords, don't overwrite
+                        pass
+
     return (
-        last_known["temp"],     last_known["pressure"],
-        last_known["ax"],       last_known["ay"],
-        last_known["az"],       last_known["lat"],
+        last_known["temp"],
+        last_known["pressure"],
+        last_known["ax"],
+        last_known["ay"],
+        last_known["az"],
+        last_known["lat"],
         last_known["lon"],
+        last_known["fix"],
     )
 
 
@@ -194,8 +223,11 @@ def show_map():
         icon=folium.Icon(color="green", icon="tree", prefix="fa"),
     ).add_to(map_obj)
     if path:
-        folium.Marker(path[-1], tooltip="Current Position",
-                      icon=folium.Icon(color="blue", icon="circle")).add_to(map_obj)
+        folium.Marker(
+            path[-1],
+            tooltip="Current Position",
+            icon=folium.Icon(color="blue", icon="circle"),
+        ).add_to(map_obj)
         folium.PolyLine(path, color="#00C2A8", weight=4, opacity=0.8).add_to(map_obj)
     map_obj.save("map.html")
     webbrowser.open("map.html")
@@ -206,17 +238,16 @@ def show_map():
 # ═════════════════════════════════════════════════════════════════════════════
 
 def update():
-    temp, pressure, ax, ay, az, lat, lon = read_sample()
+    temp, pressure, ax, ay, az, lat, lon, fix = read_sample()
 
     if temp is None:
         root.after(LOG_UPDATE_INTERVAL_MS, update)
         return
 
-    # Risk comes from ESP via RISK: line — default LOW until first arrives
     risk = last_known["risk"] if last_known["risk"] else "LOW"
     fall = (risk == "CRITICAL")
 
-    # G-force for display only (math stays on ESP)
+    # G-force magnitude for display
     accel_g = math.sqrt(ax**2 + ay**2 + az**2) / 16384.0
 
     now = datetime.now().strftime("%H:%M:%S")
@@ -224,7 +255,7 @@ def update():
     times.append(now)
     path.append((lat, lon))
 
-    # ── Cards ─────────────────────────────────────────────────────────────────
+    # ── Sensor cards ──────────────────────────────────────────────────────────
     temp_val.config(text=f"{temp:.1f}")
     temp_unit.config(text="°C")
 
@@ -238,7 +269,13 @@ def update():
     g_val.config(text=f"{accel_g:.2f}")
     g_unit.config(text="g")
 
+    # GPS location card — show fix status in label color
     loc_val.config(text=f"{lat:.5f}, {lon:.5f}")
+    if fix == "1":
+        gps_label.config(text="GPS Location  ✔ FIX", fg=ACCENT)
+    else:
+        gps_label.config(text="GPS Location  ✘ NO FIX", fg=CRIT_COL)
+
     time_val.config(text=now)
 
     # ── Risk badge ────────────────────────────────────────────────────────────
@@ -251,9 +288,13 @@ def update():
     )
 
     # ── Status bar ────────────────────────────────────────────────────────────
-    status_var.set(f"Last update: {now}   |   Risk: {risk}   |   g-force: {accel_g:.2f} g")
+    gps_str = "GPS FIX" if fix == "1" else "NO FIX"
+    status_var.set(
+        f"Last update: {now}   |   Risk: {risk}   |   "
+        f"g-force: {accel_g:.2f} g   |   {gps_str}"
+    )
 
-    # ── Alert sound ───────────────────────────────────────────────────────────
+    # ── Alert sound on CRITICAL ───────────────────────────────────────────────
     if risk == "CRITICAL":
         try:
             pygame.mixer.music.load("alert.wav")
@@ -261,12 +302,15 @@ def update():
         except Exception:
             pass
 
-    # ── Log ───────────────────────────────────────────────────────────────────
-    csv_writer.writerow([now, temp, pressure, ax, ay, az, lat, lon, risk, int(fall)])
+    # ── Log to CSV and DB ─────────────────────────────────────────────────────
+    csv_writer.writerow(
+        [now, temp, pressure, ax, ay, az, lat, lon, fix, risk, int(fall)]
+    )
     cursor.execute(
-        """INSERT INTO logs (time, temp, pressure, ax, ay, az, lat, lon, risk, fall_detected)
-           VALUES (?,?,?,?,?,?,?,?,?,?)""",
-        (now, temp, pressure, ax, ay, az, lat, lon, risk, int(fall)),
+        """INSERT INTO logs
+           (time, temp, pressure, ax, ay, az, lat, lon, gps_fix, risk, fall_detected)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (now, temp, pressure, ax, ay, az, lat, lon, int(fix), risk, int(fall)),
     )
     conn.commit()
 
@@ -299,7 +343,7 @@ tk.Label(hdr, text="LIVE", font=("Segoe UI", 10),
          fg=ACCENT, bg=BG).pack(side="right", pady=(6, 0))
 
 tk.Frame(root, bg=BORDER, height=1).pack(fill="x", padx=28, pady=(10, 0))
-tk.Label(root, text="Vandalur Forest  ·  12.8797°N, 80.0810°E",
+tk.Label(root, text=f"Receiver: {RECEIVER_PORT}   ·   Transmitter: {TRANSMITTER_PORT}",
          font=("Segoe UI", 9), fg=MUTED, bg=BG).pack(anchor="w", padx=28, pady=(5, 12))
 
 # ── Main layout ───────────────────────────────────────────────────────────────
@@ -319,8 +363,9 @@ def make_card(parent, label, row, col, rowspan=1, colspan=1):
                  highlightbackground=BORDER, highlightthickness=1)
     f.grid(row=row, column=col, rowspan=rowspan, columnspan=colspan,
            padx=6, pady=6, sticky="nsew")
-    tk.Label(f, text=label, font=("Segoe UI", 9), fg=MUTED, bg=CARD).pack(anchor="w")
-    return f
+    lbl = tk.Label(f, text=label, font=("Segoe UI", 9), fg=MUTED, bg=CARD)
+    lbl.pack(anchor="w")
+    return f, lbl
 
 for c in range(3):
     left.grid_columnconfigure(c, weight=1)
@@ -328,8 +373,8 @@ for r in range(3):
     left.grid_rowconfigure(r, weight=1)
 
 # Temperature
-c_temp = make_card(left, "Temperature", 0, 0)
-row_t  = tk.Frame(c_temp, bg=CARD)
+c_temp, _ = make_card(left, "Temperature", 0, 0)
+row_t = tk.Frame(c_temp, bg=CARD)
 row_t.pack(anchor="w", pady=(6, 0))
 temp_val  = tk.Label(row_t, text="--", font=("Segoe UI", 30, "bold"), fg=TEXT, bg=CARD)
 temp_val.pack(side="left")
@@ -337,8 +382,8 @@ temp_unit = tk.Label(row_t, text="", font=("Segoe UI", 14), fg=MUTED, bg=CARD)
 temp_unit.pack(side="left", pady=(10, 0))
 
 # Pressure
-c_pres = make_card(left, "Pressure", 0, 1)
-row_p  = tk.Frame(c_pres, bg=CARD)
+c_pres, _ = make_card(left, "Pressure", 0, 1)
+row_p = tk.Frame(c_pres, bg=CARD)
 row_p.pack(anchor="w", pady=(6, 0))
 pressure_val  = tk.Label(row_p, text="--", font=("Segoe UI", 30, "bold"), fg=TEXT, bg=CARD)
 pressure_val.pack(side="left")
@@ -346,7 +391,7 @@ pressure_unit = tk.Label(row_p, text="", font=("Segoe UI", 14), fg=MUTED, bg=CAR
 pressure_unit.pack(side="left", pady=(10, 0))
 
 # G-force
-c_g   = make_card(left, "G-Force", 0, 2)
+c_g, _ = make_card(left, "G-Force", 0, 2)
 row_g = tk.Frame(c_g, bg=CARD)
 row_g.pack(anchor="w", pady=(6, 0))
 g_val  = tk.Label(row_g, text="--", font=("Segoe UI", 30, "bold"), fg=ACCENT, bg=CARD)
@@ -355,8 +400,8 @@ g_unit = tk.Label(row_g, text="", font=("Segoe UI", 14), fg=MUTED, bg=CARD)
 g_unit.pack(side="left", pady=(10, 0))
 
 # Accelerometer
-c_accel   = make_card(left, "Accelerometer  (AX / AY / AZ)", 1, 0, colspan=2)
-accel_row = tk.Frame(c_accel, bg=CARD)
+c_accel, _ = make_card(left, "Accelerometer  (AX / AY / AZ)", 1, 0, colspan=2)
+accel_row   = tk.Frame(c_accel, bg=CARD)
 accel_row.pack(anchor="w", pady=(6, 0), fill="x")
 
 ax_val = ay_val = az_val = None
@@ -370,26 +415,26 @@ for lbl_text, attr in [("AX", "ax"), ("AY", "ay"), ("AZ", "az")]:
     elif attr == "ay": ay_val = lbl
     else:              az_val = lbl
 
-# Location
-c_loc = make_card(left, "GPS Location", 1, 2)
+# GPS Location — label saved so fix status can update its color
+c_loc, gps_label = make_card(left, "GPS Location  ✘ NO FIX", 1, 2)
 loc_val = tk.Label(c_loc, text="--", font=("Segoe UI", 13, "bold"),
                    fg=TEXT, bg=CARD, wraplength=170)
 loc_val.pack(anchor="w", pady=(6, 0))
 
 # Risk
-c_risk = make_card(left, "Risk Level", 2, 0)
+c_risk, _ = make_card(left, "Risk Level", 2, 0)
 risk_val = tk.Label(c_risk, text="--", font=("Segoe UI", 16, "bold"),
                     bg=ACCENT, fg="#FFFFFF", padx=14, pady=6)
 risk_val.pack(anchor="w", pady=(8, 0))
 
 # Fall detection
-c_fall = make_card(left, "Fall Detection", 2, 1)
+c_fall, _ = make_card(left, "Fall Detection", 2, 1)
 fall_val = tk.Label(c_fall, text="--", font=("Segoe UI", 16, "bold"),
                     bg=ACCENT2, fg="#FFFFFF", padx=14, pady=6)
 fall_val.pack(anchor="w", pady=(8, 0))
 
 # Last update
-c_time = make_card(left, "Last Update", 2, 2)
+c_time, _ = make_card(left, "Last Update", 2, 2)
 time_val = tk.Label(c_time, text="--", font=("Segoe UI", 20, "bold"), fg=MUTED, bg=CARD)
 time_val.pack(anchor="w", pady=(6, 0))
 
@@ -430,7 +475,7 @@ tk.Frame(right, bg=BORDER, height=1).pack(fill="x", pady=14)
 tk.Label(right, text="Risk Source", font=("Segoe UI", 10, "bold"),
          fg=TEXT, bg=CARD2).pack(anchor="w")
 tk.Label(right,
-         text="Calculated on\nESP8266 receiver.\nDelta-g + fall\ndetection logic.",
+         text="Calculated on\nESP8266 receiver.\nWeighted WRS:\nTemp + Pressure\n+ Delta-g + Fall",
          font=("Segoe UI", 9), fg=MUTED, bg=CARD2,
          justify="left").pack(anchor="w", pady=(4, 0))
 
