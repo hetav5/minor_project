@@ -322,7 +322,7 @@ def update():
 # ═════════════════════════════════════════════════════════════════════════════
 
 root = tk.Tk()
-root.title("WILDSAFE — Animal Monitoring System")
+root.title("WILDSAFE — Human Exploration Safety System")
 root.geometry("1020x620")
 root.minsize(900, 560)
 root.configure(bg=BG)
@@ -333,7 +333,7 @@ hdr.pack(fill="x", padx=28, pady=(20, 0))
 
 tk.Label(hdr, text="WILDSAFE", font=("Segoe UI", 26, "bold"),
          fg=ACCENT, bg=BG).pack(side="left")
-tk.Label(hdr, text="  Animal Monitoring System", font=("Segoe UI", 14),
+tk.Label(hdr, text="  Human Exploration Safety System", font=("Segoe UI", 14),
          fg=MUTED, bg=BG).pack(side="left", pady=(6, 0))
 
 dot_canvas = tk.Canvas(hdr, width=10, height=10, bg=BG, highlightthickness=0)
